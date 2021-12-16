@@ -109,7 +109,7 @@ use std::sync::Arc;
 pub use self::event::Event;
 pub use self::fence::Fence;
 pub use self::fence::FenceWaitError;
-pub use self::future::now;
+pub use self::future::{now, queued_now};
 pub use self::future::AccessCheckError;
 pub use self::future::AccessError;
 pub use self::future::FenceSignalFuture;
@@ -125,12 +125,13 @@ pub use self::pipeline::PipelineStages;
 pub use self::semaphore::ExternalSemaphoreHandleType;
 pub use self::semaphore::Semaphore;
 pub use self::semaphore::SemaphoreError;
+pub use self::future::then_signal_exported_semaphore;
 
 mod event;
 mod fence;
 mod future;
 mod pipeline;
-pub(crate) mod semaphore;
+mod semaphore;
 
 /// Declares in which queue(s) a resource can be used.
 ///

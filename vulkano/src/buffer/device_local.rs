@@ -59,7 +59,9 @@ use std::sync::Mutex;
 ))]
 use {crate::memory::ExternalMemoryHandleType, std::fs::File};
 
-/// Buffer whose content is in device-local memory.
+#[cfg(feature = "win32")]
+#[cfg(target_os = "windows")]
+use {crate::memory::ExternalMemoryHandleType, std::ptr::NonNull};/// Buffer whose content is in device-local memory.
 ///
 /// This buffer type is useful in order to store intermediary data. For example you execute a
 /// compute shader that writes to this buffer, then read the content of the buffer in a following
@@ -116,6 +118,20 @@ impl<T> DeviceLocalBuffer<T> {
 }
 
 impl<T> DeviceLocalBuffer<[T]> {
+    #[cfg(feature = "win32")]
+    #[inline]
+    #[cfg(target_os = "windows")]
+    pub fn exportable_array<'a, I>(
+        device: Arc<Device>,
+        len: usize,
+        usage: BufferUsage,
+        queue_families: I,
+    ) -> Result<Arc<DeviceLocalBuffer<[T]>>, DeviceMemoryAllocError>
+        where
+            I: IntoIterator<Item = QueueFamily<'a>>
+    {
+        unsafe { DeviceLocalBuffer::raw_with_exportable_handle(device, (len * std::mem::size_of::<T>()) as DeviceSize, usage, queue_families) }
+    }
     /// Builds a new buffer. Can be used for arrays.
     // TODO: unsafe because uninitialized data
     #[inline]
@@ -140,6 +156,53 @@ impl<T> DeviceLocalBuffer<[T]> {
 }
 
 impl<T: ?Sized> DeviceLocalBuffer<T> {
+    #[cfg(feature = "win32")]
+    #[cfg(target_os = "windows")]
+    unsafe fn raw_with_exportable_handle<'a, I>(
+        device: Arc<Device>,
+        size: DeviceSize,
+        usage: BufferUsage,
+        queue_families: I,
+    ) -> Result<Arc<DeviceLocalBuffer<T>>, DeviceMemoryAllocError>
+    where
+        I: IntoIterator<Item = QueueFamily<'a>>,
+    {
+        assert!(device.enabled_extensions().khr_external_memory_win32);
+        assert!(device.enabled_extensions().khr_external_memory);
+
+        let queue_families = queue_families
+            .into_iter()
+            .map(|f| f.id())
+            .collect::<SmallVec<[u32; 4]>>();
+
+        let (buffer, mem_reqs) = Self::build_exportable_buffer(&device, size, usage, &queue_families)?;
+
+        let mem = MemoryPool::alloc_from_requirements_with_exportable_handle(
+            &Device::standard_pool(&device),
+            &mem_reqs,
+            AllocLayout::Linear,
+            MappingRequirement::DoNotMap,
+            DedicatedAlloc::Buffer(&buffer),
+            |t| {
+                if t.is_device_local() {
+                    AllocFromRequirementsFilter::Preferred
+                } else {
+                    AllocFromRequirementsFilter::Allowed
+                }
+            },
+        )?;
+        debug_assert!((mem.offset() % mem_reqs.alignment) == 0);
+        buffer.bind_memory(mem.memory(), mem.offset())?;
+
+        Ok(Arc::new(DeviceLocalBuffer {
+            inner: buffer,
+            memory: mem,
+            queue_families: queue_families,
+            gpu_lock: Mutex::new(GpuAccess::None),
+            marker: PhantomData,
+        }))
+    }
+
     /// Builds a new buffer without checking the size.
     ///
     /// # Safety
@@ -264,7 +327,30 @@ impl<T: ?Sized> DeviceLocalBuffer<T> {
         };
         Ok((buffer, mem_reqs))
     }
+    #[cfg(feature = "win32")]
+    #[cfg(target_os = "windows")]
+    unsafe fn build_exportable_buffer(
+        device: &Arc<Device>,
+        size: DeviceSize,
+        usage: BufferUsage,
+        queue_families: &SmallVec<[u32; 4]>,
+    ) -> Result<(UnsafeBuffer, MemoryRequirements), DeviceMemoryAllocError> {
+        let (buffer, mem_reqs) = {
+            let sharing = if queue_families.len() >= 2 {
+                Sharing::Concurrent(queue_families.iter().cloned())
+            } else {
+                Sharing::Exclusive
+            };
 
+            match UnsafeBuffer::new_exportable(device.clone(), size, usage, sharing, None) {
+                Ok(b) => b,
+                Err(BufferCreationError::AllocError(err)) => return Err(err),
+                Err(_) => unreachable!(), // We don't use sparse binding, therefore the other
+                                          // errors can't happen
+            }
+        };
+        Ok((buffer, mem_reqs))
+    }
     /// Exports posix file descriptor for the allocated memory
     /// requires `khr_external_memory_fd` and `khr_external_memory` extensions to be loaded.
     /// Only works on Linux/BSD.
@@ -279,6 +365,15 @@ impl<T: ?Sized> DeviceLocalBuffer<T> {
         self.memory
             .memory()
             .export_fd(ExternalMemoryHandleType::posix())
+    }
+    #[cfg(feature = "win32")]
+    #[cfg(target_os = "windows")]
+    pub fn export_win32_handle(&self) -> Result<NonNull<std::ffi::c_void>, DeviceMemoryAllocError> {
+        unsafe {
+            self.memory
+            .memory()
+            .export_handle(ExternalMemoryHandleType::win32())
+        }
     }
 }
 

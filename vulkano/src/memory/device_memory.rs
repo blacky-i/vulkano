@@ -46,6 +46,9 @@ use std::os::unix::io::{FromRawFd, IntoRawFd};
 use std::ptr;
 use std::sync::Arc;
 use std::sync::Mutex;
+#[cfg(feature = "win32")]
+#[cfg(target_os = "windows")]
+use std::ptr::NonNull;
 
 #[repr(C)]
 pub struct BaseOutStructure {
@@ -113,6 +116,7 @@ pub struct DeviceMemoryBuilder<'a> {
     allocate: ash::vk::MemoryAllocateInfo,
     dedicated_info: Option<ash::vk::MemoryDedicatedAllocateInfoKHR>,
     export_info: Option<ash::vk::ExportMemoryAllocateInfo>,
+    export_win32_info: Option<ash::vk::ExportMemoryWin32HandleInfoKHR>,
     import_info: Option<ash::vk::ImportMemoryFdInfoKHR>,
     marker: PhantomData<&'a ()>,
 }
@@ -136,6 +140,7 @@ impl<'a> DeviceMemoryBuilder<'a> {
             allocate,
             dedicated_info: None,
             export_info: None,
+            export_win32_info: None,
             import_info: None,
             marker: PhantomData,
         }
@@ -187,13 +192,21 @@ impl<'a> DeviceMemoryBuilder<'a> {
     ) -> DeviceMemoryBuilder<'a> {
         assert!(self.export_info.is_none());
 
-        let mut export_info = ash::vk::ExportMemoryAllocateInfo {
+        let win32_export_info = ash::vk::ExportMemoryWin32HandleInfoKHR {
+            dw_access:  2147483649  as ash::vk::DWORD, //DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE
+            ..Default::default()
+        };
+       
+        self.export_win32_info = Some(win32_export_info);
+
+        let export_info = ash::vk::ExportMemoryAllocateInfo {
             handle_types: handle_types.into(),
             ..Default::default()
         };
+        // self = self.push_next(&mut export_info);
 
-        self = self.push_next(&mut export_info);
         self.export_info = Some(export_info);
+                
         self
     }
 
@@ -230,7 +243,7 @@ impl<'a> DeviceMemoryBuilder<'a> {
     // Private function copied shamelessly from Ash.
     // https://github.com/MaikKlein/ash/blob/4ba8637d018fec6d6e3a90d7fa47d11c085f6b4a/generator/src/lib.rs
     #[allow(unused_assignments)]
-    fn push_next<T: ExtendsMemoryAllocateInfo>(self, next: &mut T) -> DeviceMemoryBuilder<'a> {
+    fn push_next<T: ExtendsMemoryAllocateInfo>(mut self, next: &mut T) -> DeviceMemoryBuilder<'a> {
         unsafe {
             // `next` here can contain a pointer chain. This means that we must correctly
             // attach he head to the root and the tail to the rest of the chain
@@ -250,6 +263,7 @@ impl<'a> DeviceMemoryBuilder<'a> {
             if !prev_head.is_null() {
                 (*last_next).p_next = (*prev_head).p_next;
             }
+
             // Set next ptr to be first one
             prev_head = next_ptr;
         }
@@ -260,7 +274,7 @@ impl<'a> DeviceMemoryBuilder<'a> {
     /// Creates a `DeviceMemory` object on success, consuming the `DeviceMemoryBuilder`.  An error
     /// is returned if the requested allocation is too large or if the total number of allocations
     /// would exceed per-device limits.
-    pub fn build(self) -> Result<Arc<DeviceMemory>, DeviceMemoryAllocError> {
+    pub fn build(mut self) -> Result<Arc<DeviceMemory>, DeviceMemoryAllocError> {
         if self.allocate.allocation_size == 0 {
             return Err(DeviceMemoryAllocError::InvalidSize)?;
         }
@@ -298,10 +312,11 @@ impl<'a> DeviceMemoryBuilder<'a> {
         }
 
         let mut export_handle_bits = ash::vk::ExternalMemoryHandleTypeFlags::empty();
-
         if self.export_info.is_some() || self.import_info.is_some() {
             // TODO: check exportFromImportedHandleTypes
-            export_handle_bits = match self.export_info {
+
+            
+            export_handle_bits = match self.export_info.as_ref() {
                 Some(export_info) => export_info.handle_types,
                 None => ash::vk::ExternalMemoryHandleTypeFlags::empty(),
             };
@@ -348,8 +363,15 @@ impl<'a> DeviceMemoryBuilder<'a> {
                     ));
                 }
             }
+            if !(import_handle_bits & ash::vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32).is_empty()
+            {
+                if !self.device.enabled_extensions().khr_external_memory_win32 {
+                    return Err(DeviceMemoryAllocError::MissingExtension(
+                        "khr_external_memory_win32",
+                    ));
+                }
+            }
         }
-
         let memory = unsafe {
             let physical_device = self.device.physical_device();
             let mut allocation_count = self
@@ -362,6 +384,16 @@ impl<'a> DeviceMemoryBuilder<'a> {
                 return Err(DeviceMemoryAllocError::TooManyObjects);
             }
             let fns = self.device.fns();
+
+            if self.export_info.is_some() {
+                let export_struct = self.export_info.as_mut().unwrap();
+                if self.export_win32_info.is_some() {
+                    let win32_ptr = self.export_win32_info.as_ref().unwrap() as * const _;
+                    export_struct.p_next = win32_ptr as * const std::ffi::c_void;
+                }
+                let ptr = export_struct as * const _;
+                self.allocate.p_next = ptr as * const std::ffi::c_void;
+            }
 
             let mut output = MaybeUninit::uninit();
             check_errors(fns.v1_0.allocate_memory(
@@ -566,6 +598,90 @@ impl DeviceMemory {
         Self::map_allocation(device.clone(), mem)
     }
 
+    /// Same as `alloc`, but allows exportable file descriptor on Windows.
+    #[cfg(feature = "win32")]
+    #[cfg(target_os = "windows")]
+    #[inline]
+    pub fn alloc_with_exportable_handle(
+        device: Arc<Device>,
+        memory_type: MemoryType,
+        size: DeviceSize,
+    ) -> Result<DeviceMemory, DeviceMemoryAllocError> {
+        let memory = DeviceMemoryBuilder::new(device, memory_type.id(), size)
+            .export_info(ExternalMemoryHandleType {
+                opaque_win32: true,
+                ..ExternalMemoryHandleType::none()
+            })
+            .build()?;
+
+        // Will never panic because we call the DeviceMemoryBuilder internally, and that only
+        // returns an atomically refcounted DeviceMemory object on success.
+        Ok(Arc::try_unwrap(memory).unwrap())
+    }
+
+    /// Same as `dedicated_alloc`, but allows exportable file descriptor on Windows.
+    #[cfg(feature = "win32")]
+    #[inline]
+    #[cfg(target_os = "windows")]
+    pub fn dedicated_alloc_with_exportable_handle(
+        device: Arc<Device>,
+        memory_type: MemoryType,
+        size: DeviceSize,
+        resource: DedicatedAlloc,
+    ) -> Result<DeviceMemory, DeviceMemoryAllocError> {
+        let memory = DeviceMemoryBuilder::new(device, memory_type.id(), size)
+            .export_info(ExternalMemoryHandleType {
+                opaque_win32: true,
+                ..ExternalMemoryHandleType::none()
+            })
+            .dedicated_info(resource)
+            .build()?;
+
+        // Will never panic because we call the DeviceMemoryBuilder internally, and that only
+        // returns an atomically refcounted DeviceMemory object on success.
+        Ok(Arc::try_unwrap(memory).unwrap())
+    }
+
+    /// Same as `alloc_and_map`, but allows exportable file descriptor on Windows.
+    #[cfg(feature = "win32")]
+    #[cfg(target_os = "windows")]
+    #[inline]
+    pub fn alloc_and_map_with_exportable_handle(
+        device: Arc<Device>,
+        memory_type: MemoryType,
+        size: DeviceSize,
+    ) -> Result<MappedDeviceMemory, DeviceMemoryAllocError> {
+        DeviceMemory::dedicated_alloc_and_map_with_exportable_handle(
+            device,
+            memory_type,
+            size,
+            DedicatedAlloc::None,
+        )
+    }
+
+    /// Same as `dedicated_alloc_and_map`, but allows exportable file descriptor on Linux.
+    #[cfg(feature = "win32")]
+    #[cfg(target_os = "windows")]
+    #[inline]
+    pub fn dedicated_alloc_and_map_with_exportable_handle(
+        device: Arc<Device>,
+        memory_type: MemoryType,
+        size: DeviceSize,
+        resource: DedicatedAlloc,
+    ) -> Result<MappedDeviceMemory, DeviceMemoryAllocError> {
+        let fns = device.fns();
+
+        assert!(memory_type.is_host_visible());
+        let mem = DeviceMemory::dedicated_alloc_with_exportable_handle(
+            device.clone(),
+            memory_type,
+            size,
+            resource,
+        )?;
+
+        Self::map_allocation(device.clone(), mem)
+    }
+
     fn map_allocation(
         device: Arc<Device>,
         mem: DeviceMemory,
@@ -661,6 +777,48 @@ impl DeviceMemory {
 
         let file = unsafe { File::from_raw_fd(fd) };
         Ok(file)
+    }
+    #[inline]
+    #[cfg(target_os = "windows")]
+    pub unsafe fn export_handle(
+        &self,
+        handle_type: ExternalMemoryHandleType,
+    ) -> Result<NonNull<std::ffi::c_void>, DeviceMemoryAllocError> {
+        let fns = self.device.fns();
+        let bits = ash::vk::ExternalMemoryHandleTypeFlags::from(handle_type);
+
+        // VVUID-VkMemoryGetWin32HandleInfoKHR-handleType-00664 handleType must be
+        // defined as an NT handle or a global share handle".
+        
+        // TODO: Check for defining
+
+        // VUID-VkMemoryGetWin32HandleInfoKHR-handleType-00663 If handleType is defined as an NT handle,
+        // vkGetMemoryWin32HandleKHR must be called no more than once for each valid unique combination of memory and handleType
+        
+        // TODO: Check for calling
+
+        // VUID-VkMemoryGetWin32HandleInfoKHR-handleType-00662: "handleType must have been included in
+        // VkExportMemoryAllocateInfo::handleTypes when memory was created".
+        if (bits & ash::vk::ExternalMemoryHandleTypeFlags::from(self.handle_types)).is_empty() {
+            return Err(DeviceMemoryAllocError::SpecViolation(662))?;
+        }
+
+        let fd = unsafe {
+            let info = ash::vk::MemoryGetWin32HandleInfoKHR {
+                memory: self.memory,
+                handle_type: ExternalMemoryHandleType::win32().into(),
+                ..Default::default()
+            };
+
+            let mut handle = std::ptr::null_mut();            
+            check_errors(fns.khr_external_memory_win32.get_memory_win32_handle_khr(
+                self.device.internal_object(),
+                &info,
+                &mut handle
+            ))?;
+            handle
+        };
+        Ok(NonNull::new(fd).expect("memory handle created"))
     }
 }
 
