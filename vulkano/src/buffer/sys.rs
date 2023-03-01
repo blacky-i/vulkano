@@ -36,8 +36,6 @@ use crate::Error;
 use crate::OomError;
 use crate::VulkanObject;
 use crate::{buffer::BufferUsage, Version};
-#[cfg(feature = "win32")]
-#[cfg(target_os = "windows")]
 use crate::memory::ExternalMemoryHandleType;
 use ash::vk::Handle;
 use smallvec::SmallVec;
@@ -321,11 +319,17 @@ impl UnsafeBuffer {
                 Sharing::Concurrent(ids) => (ash::vk::SharingMode::CONCURRENT, ids.collect()),
             };
 
-            let mut p_next = ash::vk::ExternalMemoryBufferCreateInfo{
-                handle_types: ExternalMemoryHandleType::win32().into(),
-                ..Default::default()
+            let mut p_next =  if cfg!(target_os = "windows") {
+                ash::vk::ExternalMemoryBufferCreateInfo{
+                    handle_types: ExternalMemoryHandleType::win32().into(),
+                    ..Default::default()
+                }
+            } else {
+                ash::vk::ExternalMemoryBufferCreateInfo{
+                    handle_types: ExternalMemoryHandleType::posix().into(),
+                    ..Default::default()
+                }
             };
-
             let infos = ash::vk::BufferCreateInfo::builder()
             .flags(flags)
             .size(size as u64)
