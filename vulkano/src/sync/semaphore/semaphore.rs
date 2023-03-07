@@ -40,6 +40,29 @@ use std::ptr::NonNull;
 
 use crate::sync::semaphore::ExternalSemaphoreHandleType;
 
+
+/// Traits for exportable 
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonflybsd",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+pub trait ExportableFd<D> where
+D: SafeDeref<Target = Device>,
+{
+    #[inline]
+    fn alloc_with_exportable(device: D) -> Result<Semaphore<D>, SemaphoreError>;
+}
+#[cfg(feature="win32")]
+#[cfg(target_os = "windows")]
+pub trait ExportableHandle<D> where
+D: SafeDeref<Target = Device>,
+{
+    #[inline]
+    fn alloc_with_exportable(device: D) -> Result<Semaphore<D>, SemaphoreError>;
+}
 /// Used to provide synchronization between command buffers during their execution.
 ///
 /// It is similar to a fence, except that it is purely on the GPU side. The CPU can't query a
@@ -302,6 +325,47 @@ where
     }
 }
 
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonflybsd",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+impl<D> ExportableFd<D> for Semaphore<D>
+where
+    D: SafeDeref<Target = Device>,
+{
+    /// Same as `alloc`, but allows exportable opaque file descriptor on Linux/BSD
+    #[inline]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "dragonflybsd",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    fn alloc_with_exportable(device: D) -> Result<Semaphore<D>, SemaphoreError> {
+        SemaphoreBuilder::new(device)
+            .export_info(ExternalSemaphoreHandleType::posix())
+            .build()
+    }
+}
+#[cfg(feature="win32")]
+#[cfg(target_os = "windows")]
+impl<D> ExportableHandle<D> for Semaphore<D>
+where
+    D: SafeDeref<Target = Device>,
+{
+    #[inline]
+    #[cfg(feature="win32")]
+    #[cfg(target_os = "windows")]
+    pub fn alloc_with_exportable(device: D) -> Result<Semaphore<D>, SemaphoreError> {
+        SemaphoreBuilder::new(device)
+            .export_info(ExternalSemaphoreHandleType::win32())
+            .build_exportable_win()
+    }
+}
 unsafe impl DeviceOwned for Semaphore {
     #[inline]
     fn device(&self) -> &Arc<Device> {

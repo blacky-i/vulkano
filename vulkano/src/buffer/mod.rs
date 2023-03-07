@@ -89,6 +89,18 @@ pub use self::traits::TypedBufferAccess;
 pub use self::usage::BufferUsage;
 pub use self::view::BufferView;
 pub use self::view::BufferViewRef;
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonflybsd",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+pub use self::device_local::{ExportablePosix};
+
+#[cfg(feature = "win32")]
+#[cfg(target_os = "windows")]
+pub use self::device_local::{ExportableHandle};
 
 pub mod cpu_access;
 pub mod cpu_pool;

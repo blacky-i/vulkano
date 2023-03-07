@@ -61,7 +61,42 @@ use {crate::memory::ExternalMemoryHandleType, std::fs::File};
 
 #[cfg(feature = "win32")]
 #[cfg(target_os = "windows")]
-use {crate::memory::ExternalMemoryHandleType, std::ptr::NonNull};/// Buffer whose content is in device-local memory.
+use {crate::memory::ExternalMemoryHandleType, std::ptr::NonNull};
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonflybsd",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+
+pub trait ExportablePosix<T>
+
+{
+    fn exportable_array<'a, I>(
+        device: Arc<Device>,
+        len: usize,
+        usage: BufferUsage,
+        queue_families: I,
+    ) -> Result<Arc<DeviceLocalBuffer<[T]>>, DeviceMemoryAllocError> where
+    I: IntoIterator<Item = QueueFamily<'a>>;
+    fn export_handle(&self) -> Result<File, DeviceMemoryAllocError>;
+}
+#[cfg(feature = "win32")]
+#[cfg(target_os = "windows")]
+pub trait ExportableHandle<T>
+{
+    fn exportable_array<'a, I>(
+        device: Arc<Device>,
+        len: usize,
+        usage: BufferUsage,
+        queue_families: I,
+    ) -> Result<Arc<DeviceLocalBuffer<[T]>>, DeviceMemoryAllocError>where
+    I: IntoIterator<Item = QueueFamily<'a>>;
+    fn export_handle(&self) -> Result<NonNull<std::ffi::c_void>, DeviceMemoryAllocError>;
+}
+/// Buffer whose content is in device-local memory.
 ///
 /// This buffer type is useful in order to store intermediary data. For example you execute a
 /// compute shader that writes to this buffer, then read the content of the buffer in a following
@@ -118,20 +153,7 @@ impl<T> DeviceLocalBuffer<T> {
 }
 
 impl<T> DeviceLocalBuffer<[T]> {
-    #[cfg(feature = "win32")]
-    #[inline]
-    #[cfg(target_os = "windows")]
-    pub fn exportable_array<'a, I>(
-        device: Arc<Device>,
-        len: usize,
-        usage: BufferUsage,
-        queue_families: I,
-    ) -> Result<Arc<DeviceLocalBuffer<[T]>>, DeviceMemoryAllocError>
-        where
-            I: IntoIterator<Item = QueueFamily<'a>>
-    {
-        unsafe { DeviceLocalBuffer::raw_with_exportable_handle(device, (len * std::mem::size_of::<T>()) as DeviceSize, usage, queue_families) }
-    }
+ 
     /// Builds a new buffer. Can be used for arrays.
     // TODO: unsafe because uninitialized data
     #[inline]
@@ -526,5 +548,55 @@ where
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.inner().hash(state);
         self.size().hash(state);
+    }
+}
+#[cfg(feature = "win32")]
+#[cfg(target_os = "windows")]
+impl<T> ExportableHandle<T> for DeviceLocalBuffer<[T]> {
+    #[inline]
+    fn exportable_array<'a, I>(
+        device: Arc<Device>,
+        len: usize,
+        usage: BufferUsage,
+        queue_families: I,
+    ) -> Result<Arc<DeviceLocalBuffer<[T]>>, DeviceMemoryAllocError>
+        where
+            I: IntoIterator<Item = QueueFamily<'a>>
+    {
+        unsafe { DeviceLocalBuffer::raw_with_exportable_handle(device, (len * std::mem::size_of::<T>()) as DeviceSize, usage, queue_families) }
+    }
+
+    fn export_handle(&self) -> Result<NonNull<std::ffi::c_void>, DeviceMemoryAllocError> {
+        unsafe {
+            self.memory
+            .memory()
+            .export_handle(ExternalMemoryHandleType::win32())
+        }
+    }
+}
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonflybsd",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+impl<T> ExportablePosix<T> for DeviceLocalBuffer<[T]> {
+    #[inline]
+    fn exportable_array<'a, I>(
+        device: Arc<Device>,
+        len: usize,
+        usage: BufferUsage,
+        queue_families: I,
+    ) -> Result<Arc<DeviceLocalBuffer<[T]>>, DeviceMemoryAllocError>
+        where
+            I: IntoIterator<Item = QueueFamily<'a>>
+    {
+        unsafe { DeviceLocalBuffer::raw_with_exportable_fd(device, (len * std::mem::size_of::<T>()) as DeviceSize, usage, queue_families) }
+    }
+    fn export_handle(&self) -> Result<File, DeviceMemoryAllocError> {
+        self.memory
+            .memory()
+            .export_fd(ExternalMemoryHandleType::posix())
     }
 }
